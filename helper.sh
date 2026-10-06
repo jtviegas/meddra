@@ -127,10 +127,10 @@ update_bashutils(){
   cd "$this_folder" || exit 1
 
   echo "$release_json" | python3 -c "
-  import sys, json
-  assets = json.load(sys.stdin).get('assets', [])
-  for a in assets:
-      print(a['id'], a['name'])
+import sys, json
+assets = json.load(sys.stdin).get('assets', [])
+for a in assets:
+    print(a['id'], a['name'])
   " | while read -r asset_id asset_name; do
     info "[get_updated_release] downloading asset: $asset_name (id: $asset_id)"
     eval curl -fsSL -H "\"Accept: application/octet-stream\"" \

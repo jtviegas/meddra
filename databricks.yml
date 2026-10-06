@@ -1,0 +1,264 @@
+bundle:
+  name: ssds_meddra
+
+# allows you to pass variables to the bundle at deployment.
+# Used to deploy the bundle to different environments
+variables:
+  # dev, tst, val, prd (or whatever your environments are called)  
+  environment:
+    description: the environment to use
+    default: dev
+  organisation:
+    description: tag
+    default: novonordisk
+  domain:
+    description: tag
+    default: safetysurveillance_ds
+  solution:
+    description: tag
+    default: meddradataset
+  # The identity that should run the job in databricks e.g. a 
+  # service principal (Entra ID managed identity) that 
+  # has the permission to run the job, we don't run production 
+  # workloads with our personal users.
+  run_as:
+   description: user to run as
+   default: DC-NN-global_safety_ds-PRD_Contributor
+  # By default when a bundle is deployed it will not be visible
+  # by other developers unless we specify a group that is allowed
+  # to have visiblity and manage the job. e.g. we allow our 
+  # developers to be able to see the job.
+  manage_group_name:
+    description: Name of the group that can manage the job
+    default: DC-NN-global_safety_ds-PRD_Contributor
+  pip_index_url:
+    description: url where from pip packages should be fetched
+  package_name:
+    description: package to install in the cluster
+    default: "nn-gs-ss-meddra"
+  package_spec:
+    description: package and the version to install in the cluster as provided to pip install
+    default: "nn-gs-ss-meddra==0.1.15"
+  emails:
+    description: email list to receive notifications
+    default: ["jtgv@novonordisk.com"]
+  bronze_catalog:
+    description: domain bronze catalog name
+    default: global_safety_ds_bronze
+  schema_name:
+    description: schema to use for data storage
+    default: "meddra_${var.environment}"
+  url_output_datasets:
+    description: location to store other output datasets from the processing
+    default: "/Volumes/${var.bronze_catalog}/${var.schema_name}/datasets"
+  table_preferred_terms:
+    description: table where to store medDRA preferred terms dataset
+    default: "${var.bronze_catalog}.${var.schema_name}.meddra_preferred_terms"
+  url_latest_files:
+    description: location where the latest source meddra files are stored
+    default: "/Volumes/${var.bronze_catalog}/meddra_prd/filesets/latest"
+  url_smq_nn_mapping:
+    description: location where the smq-nn mapping file is stored
+    default: "/Volumes/${var.bronze_catalog}/meddra_prd/filesets/smq-nn-mapping"
+  
+resources:
+  schemas:
+    solution:
+      name: ${var.schema_name}
+      catalog_name: ${var.bronze_catalog}
+      grants:
+        - principal: ${var.manage_group_name}
+          privileges:
+            - ALL_PRIVILEGES
+        - principal: ${var.run_as}
+          privileges:
+            - READ_VOLUME
+            - WRITE_VOLUME
+            - CREATE_TABLE
+            - MANAGE
+  volumes:  
+    tmp:
+      catalog_name: ${var.bronze_catalog}
+      name: tmp
+      schema_name: ${var.schema_name}
+    datasets:
+      catalog_name: ${var.bronze_catalog}
+      name: datasets
+      schema_name: ${var.schema_name}
+    filesets:
+      catalog_name: ${var.bronze_catalog}
+      name: filesets
+      schema_name: ${var.schema_name}
+  jobs:
+    # The main job
+    meddra_dataset_pipeline:
+      # allow another group to manage the job (see variables)
+      # See https://learn.microsoft.com/en-us/azure/databricks/dev-tools/bundles/permissions
+      permissions:
+        - group_name: ${var.manage_group_name}
+          level: CAN_MANAGE
+      name: ${bundle.name}/data_product/${var.environment}
+      # Run job every 3 hours starting at 0.00
+      # schedule:
+      #   quartz_cron_expression: "0 0 0/3 * * ?"
+      #   timezone_id: Europe/Amsterdam
+      # add any tags relevant
+      tags:
+        # we document our source code through specifications tied to the repository.
+        # this allows us to know which specification this job refers to.
+        specification: FS-${bundle.name}-1
+        git-origin: ${bundle.git.origin_url}
+        git-commit: ${bundle.git.commit}
+        organisation: ${var.organisation}
+        domain: ${var.domain}
+        solution: ${var.solution}
+        environment: ${var.environment}
+      # Specify the computer (job cluster) that should 
+      # run the job. E.g. if you need more compute / RAM 
+      # you can choose that here.
+      job_clusters:
+        - job_cluster_key: "${var.solution}_single_node_cluster"
+          new_cluster:
+            node_type_id: "Standard_D4ds_v5"
+            spark_version: "15.4.x-photon-scala2.12"
+            num_workers: 1
+        - job_cluster_key: "${var.solution}_main_cluster_prd"
+          new_cluster:
+            node_type_id: "Standard_D4ds_v5"
+            spark_version: "15.4.x-photon-scala2.12"
+            num_workers: 6
+        - job_cluster_key: "${var.solution}_main_cluster_dev"
+          new_cluster:
+            node_type_id: "Standard_D4ds_v5"
+            spark_version: "15.4.x-photon-scala2.12"
+            num_workers: 3
+      tasks:
+        - task_key: IsProcessingDue
+          python_wheel_task:
+            entry_point: "run"
+            package_name: ${var.package_name}
+            parameters:
+              - "--module"
+              - "nn.gs.ss.meddra.etl.check_if_processing_due"
+              - "--callable"
+              - "run"
+              - "--clazz"
+              - "IsProcessingDue"
+              - "--clazzparams"
+              - "{ \"configuration\": { \"table_preferred_terms\": \"${var.table_preferred_terms}\", \"meddra_folder_url\": \"${var.url_latest_files}\", \"smq_nn_folder_url\": \"${var.url_smq_nn_mapping}\", \"run_id\": \"{{job.run_id}}\"}}"
+          # we specify the libraries to install on the cluster.
+          # This, is the location where `databricks bundle` (see below) places the wheels.
+          # This ties what `databricks bundle` builds with what is installed on the cluster.
+          libraries:
+            - pypi: 
+                package: ${var.package_spec}
+                repo: "${var.pip_index_url}"
+          # The cluster this task will run. This must the same as `job_cluster_key` at the job level.
+          job_cluster_key: "${var.solution}_single_node_cluster"
+          # teams hook for failure of jobs.
+          email_notifications:
+            on_failure: ${var.emails}
+          max_retries: 1
+        - task_key: EvaluateProcessingDue
+          depends_on:
+            - task_key: IsProcessingDue
+          condition_task:
+            op: GREATER_THAN
+            left: "{{tasks.IsProcessingDue.values.processing_due}}"
+            right: "0"
+        - task_key: MedDRAPTProcessing
+          depends_on:
+            - task_key: EvaluateProcessingDue
+              outcome: "true"
+          python_wheel_task:
+            entry_point: "run"
+            package_name: ${var.package_name}
+            parameters:
+              - "--module"
+              - "nn.gs.ss.meddra.etl.meddra_pt_processing"
+              - "--callable"
+              - "run"
+              - "--clazz"
+              - "MedDRAPTProcessing"
+              - "--clazzparams"
+              - "{ \"configuration\": {\"meddra_mapping_src_url\": \"${var.url_smq_nn_mapping}\", \"meddra_files_url\": \"${var.url_latest_files}\", \"table_preferred_terms\": \"${var.table_preferred_terms}\", \"datasets_url\": \"${var.url_output_datasets}\", \"run_id\": \"{{job.run_id}}\"}}"
+          # we specify the libraries to install on the cluster.
+          # This, is the location where `databricks bundle` (see below) places the wheels.
+          # This ties what `databricks bundle` builds with what is installed on the cluster.
+          libraries:
+            - pypi: 
+                package: ${var.package_spec}
+                repo: "${var.pip_index_url}"
+          # The cluster this task will run. This must the same as `job_cluster_key` at the job level.
+          job_cluster_key: "${var.solution}_main_cluster_${var.environment}"
+          # teams hook for failure of jobs.
+          email_notifications:
+            on_failure: ${var.emails}
+          max_retries: 1
+      timeout_seconds: 86400
+
+# In databricks the bundles are deployed to the databricks
+# workspace which lands in a git like folder structure. You can either
+# deploy bundles to /Shared/ workspace or /Users/ workspace. 
+# below section allow us to control the `target`, basically
+# where to deploy the bundle.
+
+targets:
+  # main is just a descriptive name of the target
+  prd:
+    # If the mode is configured for production, the deployment will occur in the /Shared/ directory, which  serves as the designated location for deploying production-ready bundles. This location allows any developer or CI/CD pipeline to overwrite and update the bundle when it is released next.
+    mode: production   # there are only two options: production or development
+    workspace:
+        # We can also manually specify where to deploy the bundle to using root_path
+        root_path: /Shared/.bundle/${var.domain}/${bundle.name}/prd
+    default: false
+    # We specify what identity that should run the job (see variables for more info)
+    run_as:
+      service_principal_name: ${var.run_as}
+    variables:
+      environment:
+        default: prd
+  
+  dev:
+    # If the mode is configured for production, the deployment will occur in the /Shared/ directory, which  serves as the designated location for deploying production-ready bundles. This location allows any developer or CI/CD pipeline to overwrite and update the bundle when it is released next.
+    mode: production   # there are only two options: production or development
+    workspace:
+        # We can also manually specify where to deploy the bundle to using root_path
+        root_path: /Shared/.bundle/${var.domain}/${bundle.name}/dev
+    # This is the default target, which means that when we use the databricks CLI 
+    # to deploy if we don't specify a target this will be chosen.
+    default: true
+    # We specify what identity that should run the job (see variables for more info)
+    run_as:
+      service_principal_name: ${var.run_as}
+    variables:
+      environment:
+        default: dev
+  
+  tst:
+    # If the mode is configured for production, the deployment will occur in the /Shared/ directory, which  serves as the designated location for deploying production-ready bundles. This location allows any developer or CI/CD pipeline to overwrite and update the bundle when it is released next.
+    mode: production   # there are only two options: production or development
+    workspace:
+        # We can also manually specify where to deploy the bundle to using root_path
+        root_path: /Shared/.bundle/${var.domain}/${bundle.name}/tst
+    default: false
+    # We specify what identity that should run the job (see variables for more info)
+    run_as:
+      service_principal_name: ${var.run_as}
+    variables:
+      environment:
+        default: tst
+  
+  val:
+    # If the mode is configured for production, the deployment will occur in the /Shared/ directory, which  serves as the designated location for deploying production-ready bundles. This location allows any developer or CI/CD pipeline to overwrite and update the bundle when it is released next.
+    mode: production   # there are only two options: production or development
+    workspace:
+        # We can also manually specify where to deploy the bundle to using root_path
+        root_path: /Shared/.bundle/${var.domain}/${bundle.name}/val
+    default: false
+    # We specify what identity that should run the job (see variables for more info)
+    run_as:
+      service_principal_name: ${var.run_as}
+    variables:
+      environment:
+        default: val
