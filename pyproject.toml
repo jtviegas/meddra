@@ -106,6 +106,7 @@ exclude = [
     "test/",
     "typings/",
     "src/",
+    "test.ipynb"
 ]
 
 line-length = 120
